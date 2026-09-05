@@ -1,30 +1,44 @@
 import os
+import json
+import random
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-
-from google import genai
 
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
     recall_score,
+    f1_score,
     roc_auc_score,
     confusion_matrix
 )
 
-import razorpay
+from dotenv import load_dotenv
+
+# Optional Gemini
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
+
+# Optional Razorpay
+try:
+    import razorpay
+    RAZORPAY_AVAILABLE = True
+except Exception:
+    RAZORPAY_AVAILABLE = False
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -38,9 +52,7 @@ st.set_page_config(
 # PROJECT PATHS
 # ============================================================
 
-PROJECT_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_PATH = os.path.join(
     PROJECT_DIR,
@@ -62,32 +74,50 @@ AUDIT_PATH = os.path.join(
 
 
 # ============================================================
-# ENVIRONMENT VARIABLES
+# LOAD ENVIRONMENT VARIABLES
 # ============================================================
 
 load_dotenv()
 
 
 # ============================================================
-# GEMINI CONFIGURATION
+# GET SECRETS
 # ============================================================
 
-gemini_api_key = None
+def get_secret(name):
 
-try:
-    gemini_api_key = st.secrets["GEMINI_API_KEY"]
-except Exception:
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    # Streamlit Cloud secrets
+    try:
+        value = st.secrets.get(name)
 
+        if value:
+            return value
+
+    except Exception:
+        pass
+
+    # Local .env
+    return os.getenv(name)
+
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+
+RAZORPAY_KEY_ID = get_secret("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = get_secret("RAZORPAY_KEY_SECRET")
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
 
 gemini_client = None
 
-if gemini_api_key:
+if GEMINI_AVAILABLE and GEMINI_API_KEY:
 
     try:
 
         gemini_client = genai.Client(
-            api_key=gemini_api_key
+            api_key=GEMINI_API_KEY
         )
 
     except Exception:
@@ -96,40 +126,23 @@ if gemini_api_key:
 
 
 # ============================================================
-# RAZORPAY TEST MODE CONFIGURATION
+# RAZORPAY CLIENT
 # ============================================================
-
-razorpay_key_id = None
-razorpay_key_secret = None
-
-
-try:
-
-    razorpay_key_id = st.secrets["RAZORPAY_KEY_ID"]
-    razorpay_key_secret = st.secrets["RAZORPAY_KEY_SECRET"]
-
-except Exception:
-
-    razorpay_key_id = os.getenv(
-        "RAZORPAY_KEY_ID"
-    )
-
-    razorpay_key_secret = os.getenv(
-        "RAZORPAY_KEY_SECRET"
-    )
-
 
 razorpay_client = None
 
-
-if razorpay_key_id and razorpay_key_secret:
+if (
+    RAZORPAY_AVAILABLE
+    and RAZORPAY_KEY_ID
+    and RAZORPAY_KEY_SECRET
+):
 
     try:
 
         razorpay_client = razorpay.Client(
             auth=(
-                razorpay_key_id,
-                razorpay_key_secret
+                RAZORPAY_KEY_ID,
+                RAZORPAY_KEY_SECRET
             )
         )
 
@@ -148,10 +161,10 @@ def load_transactions():
     if not os.path.exists(DATA_PATH):
 
         st.error(
-            f"Transaction dataset not found:\n{DATA_PATH}"
+            f"Dataset not found: {DATA_PATH}"
         )
 
-        return pd.DataFrame()
+        st.stop()
 
     df = pd.read_csv(
         DATA_PATH,
@@ -165,138 +178,159 @@ transactions_df = load_transactions()
 
 
 # ============================================================
-# TRAIN ML MODEL
+# CLEAN DATA
 # ============================================================
+
+def clean_transactions(df):
+
+    df = df.copy()
+
+    # Convert numeric columns
+    numeric_columns = [
+        "amount",
+        "customer_success_rate",
+        "previous_failed_attempts",
+        "is_new_device",
+        "recovered"
+    ]
+
+    for column in numeric_columns:
+
+        if column in df.columns:
+
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
+
+    # Remove rows with missing critical values
+    df = df.dropna(
+        subset=[
+            "amount",
+            "customer_success_rate",
+            "previous_failed_attempts",
+            "is_new_device",
+            "recovered"
+        ]
+    )
+
+    # Make sure failure_reason is a string
+    if "failure_reason" in df.columns:
+
+        df["failure_reason"] = (
+            df["failure_reason"]
+            .fillna("")
+            .astype(str)
+        )
+
+    if "payment_method" in df.columns:
+
+        df["payment_method"] = (
+            df["payment_method"]
+            .fillna("Unknown")
+            .astype(str)
+        )
+
+    return df
+
+
+transactions_df = clean_transactions(
+    transactions_df
+)
+
+
+# ============================================================
+# FAILED TRANSACTIONS
+# ============================================================
+
+failed_transactions = transactions_df[
+    transactions_df["status"].astype(str).str.lower() == "failed"
+].copy()
+
+
+# ============================================================
+# MODEL TRAINING
+# ============================================================
+
+FEATURES = [
+    "amount",
+    "payment_method",
+    "customer_success_rate",
+    "previous_failed_attempts",
+    "is_new_device",
+    "failure_reason"
+]
+
 
 @st.cache_resource
 def train_recovery_model(df):
 
-    features = [
-
-        "amount",
-
-        "payment_method",
-
-        "customer_success_rate",
-
-        "previous_failed_attempts",
-
-        "is_new_device",
-
-        "failure_reason"
-
-    ]
-
-    X = df[features]
+    X = df[FEATURES].copy()
 
     y = df["recovered"].astype(int)
 
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=42,
+        stratify=y
+    )
 
     categorical_features = [
-
         "payment_method",
-
         "failure_reason"
-
     ]
 
-
-    numeric_features = [
-
+    numerical_features = [
         "amount",
-
         "customer_success_rate",
-
         "previous_failed_attempts",
-
         "is_new_device"
-
     ]
-
 
     preprocessor = ColumnTransformer(
-
         transformers=[
-
             (
                 "categorical",
-
                 OneHotEncoder(
                     handle_unknown="ignore"
                 ),
-
                 categorical_features
             ),
-
             (
-                "numeric",
-
+                "numerical",
                 "passthrough",
-
-                numeric_features
+                numerical_features
             )
-
         ]
-
     )
-
 
     model = RandomForestClassifier(
-
         n_estimators=200,
-
         max_depth=8,
-
         min_samples_leaf=5,
-
         random_state=42,
-
         class_weight="balanced"
-
     )
-
 
     pipeline = Pipeline(
-
         steps=[
-
             (
                 "preprocessor",
-
                 preprocessor
             ),
-
             (
                 "model",
-
                 model
             )
-
         ]
-
     )
-
-
-    X_train, X_test, y_train, y_test = train_test_split(
-
-        X,
-
-        y,
-
-        test_size=0.20,
-
-        random_state=42,
-
-        stratify=y
-
-    )
-
 
     pipeline.fit(
         X_train,
         y_train
     )
-
 
     predictions = pipeline.predict(
         X_test
@@ -306,680 +340,277 @@ def train_recovery_model(df):
         X_test
     )[:, 1]
 
-
     metrics = {
 
-        "accuracy":
-            accuracy_score(
-                y_test,
-                predictions
-            ),
+        "accuracy": accuracy_score(
+            y_test,
+            predictions
+        ),
 
-        "precision":
-            precision_score(
-                y_test,
-                predictions,
-                zero_division=0
-            ),
+        "precision": precision_score(
+            y_test,
+            predictions,
+            zero_division=0
+        ),
 
-        "recall":
-            recall_score(
-                y_test,
-                predictions,
-                zero_division=0
-            ),
+        "recall": recall_score(
+            y_test,
+            predictions,
+            zero_division=0
+        ),
 
-        "roc_auc":
-            roc_auc_score(
-                y_test,
-                probabilities
-            ),
+        "f1": f1_score(
+            y_test,
+            predictions,
+            zero_division=0
+        ),
 
-        "confusion_matrix":
-            confusion_matrix(
-                y_test,
-                predictions
-            )
+        "roc_auc": roc_auc_score(
+            y_test,
+            probabilities
+        ),
 
+        "confusion_matrix": confusion_matrix(
+            y_test,
+            predictions
+        )
     }
-
 
     return pipeline, metrics
 
 
-if not transactions_df.empty:
+with st.spinner("Training Revenue Recovery AI model..."):
 
     recovery_model, model_metrics = train_recovery_model(
         transactions_df
     )
 
-else:
-
-    recovery_model = None
-
-    model_metrics = {}
-
 
 # ============================================================
-# LOAD BATCH RESULTS
-# ============================================================
-
-@st.cache_data
-def load_batch_results():
-
-    if os.path.exists(BATCH_PATH):
-
-        return pd.read_csv(
-            BATCH_PATH
-        )
-
-    return pd.DataFrame()
-
-
-batch_df = load_batch_results()
-
-
-# ============================================================
-# LOAD AUDIT TRAIL
-# ============================================================
-
-def load_audit_trail():
-
-    if not os.path.exists(AUDIT_PATH):
-
-        return pd.DataFrame()
-
-
-    audit_df = pd.read_csv(
-        AUDIT_PATH,
-        keep_default_na=False
-    )
-
-
-    # --------------------------------------------------------
-    # FIX OLD AUDIT FILE
-    # --------------------------------------------------------
-
-    if "razorpay_test_order_id" not in audit_df.columns:
-
-        audit_df["razorpay_test_order_id"] = ""
-
-        audit_df.to_csv(
-            AUDIT_PATH,
-            index=False
-        )
-
-
-    return audit_df
-
-
-# ============================================================
-# RAZORPAY TEST ORDER CREATION
-# ============================================================
-
-def create_razorpay_test_order(transaction):
-
-    """
-    Creates a Razorpay TEST MODE order.
-
-    This does NOT process real money.
-    """
-
-    if razorpay_client is None:
-
-        return {
-
-            "success": False,
-
-            "order_id": None,
-
-            "message":
-                "Razorpay Test API credentials are not configured."
-
-        }
-
-
-    try:
-
-        amount_in_paise = int(
-            round(
-                float(
-                    transaction["amount"]
-                ) * 100
-            )
-        )
-
-
-        order_data = {
-
-            "amount":
-                amount_in_paise,
-
-            "currency":
-                "INR",
-
-            "receipt":
-                str(
-                    transaction[
-                        "transaction_id"
-                    ]
-                ),
-
-            "notes": {
-
-                "source":
-                    "RevenueRescue AI",
-
-                "transaction_id":
-                    str(
-                        transaction[
-                            "transaction_id"
-                        ]
-                    ),
-
-                "recovery_workflow":
-                    "AI_PAYMENT_RECOVERY",
-
-                "environment":
-                    "TEST_MODE"
-
-            }
-
-        }
-
-
-        order = razorpay_client.order.create(
-            data=order_data
-        )
-
-
-        return {
-
-            "success": True,
-
-            "order_id":
-                order.get("id"),
-
-            "message":
-                "Razorpay Test Mode order created successfully."
-
-        }
-
-
-    except Exception as e:
-
-        return {
-
-            "success": False,
-
-            "order_id": None,
-
-            "message":
-                f"Razorpay Test API error: {str(e)}"
-
-        }
-
-
-# ============================================================
-# WRITE AUDIT RECORD
-# ============================================================
-
-def write_audit_record(
-
-    transaction,
-
-    ml_probability,
-
-    ai_result,
-
-    guardrail_result,
-
-    action_executed,
-
-    recovery_result,
-
-    revenue_rescued,
-
-    razorpay_order_id=""
-
-):
-
-
-    audit_record = {
-
-        "timestamp":
-
-            datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-
-        "transaction_id":
-
-            transaction[
-                "transaction_id"
-            ],
-
-
-        "amount":
-
-            float(
-                transaction["amount"]
-            ),
-
-
-        "failure_reason":
-
-            transaction[
-                "failure_reason"
-            ],
-
-
-        "previous_failed_attempts":
-
-            int(
-                transaction[
-                    "previous_failed_attempts"
-                ]
-            ),
-
-
-        "ml_recovery_probability":
-
-            float(
-                ml_probability
-            ),
-
-
-        "ai_recommendation":
-
-            ai_result.get(
-                "action",
-                ""
-            ),
-
-
-        "ai_priority":
-
-            ai_result.get(
-                "priority",
-                ""
-            ),
-
-
-        "ai_fallback_used":
-
-            ai_result.get(
-                "fallback_used",
-                False
-            ),
-
-
-        "guardrail_decision":
-
-            guardrail_result.get(
-                "approved_action",
-                ""
-            ),
-
-
-        "action_executed":
-
-            action_executed,
-
-
-        "recovery_result":
-
-            recovery_result,
-
-
-        # IMPORTANT
-        # Razorpay TEST order ID
-        "razorpay_test_order_id":
-
-            razorpay_order_id,
-
-
-        "revenue_rescued":
-
-            float(
-                revenue_rescued
-            )
-
-    }
-
-
-    audit_row = pd.DataFrame(
-        [audit_record]
-    )
-
-
-    os.makedirs(
-        os.path.dirname(
-            AUDIT_PATH
-        ),
-        exist_ok=True
-    )
-
-
-    # ========================================================
-    # EXISTING AUDIT FILE
-    # ========================================================
-
-    if os.path.exists(AUDIT_PATH):
-
-        existing_audit = pd.read_csv(
-            AUDIT_PATH,
-            keep_default_na=False
-        )
-
-
-        # Add Razorpay column if old file
-        # doesn't contain it.
-
-        if "razorpay_test_order_id" not in existing_audit.columns:
-
-            existing_audit[
-                "razorpay_test_order_id"
-            ] = ""
-
-
-        # Make sure every current column exists.
-
-        for column in audit_record.keys():
-
-            if column not in existing_audit.columns:
-
-                existing_audit[
-                    column
-                ] = ""
-
-
-        # Put columns into the correct order.
-
-        existing_audit = existing_audit[
-            list(
-                audit_record.keys()
-            )
-        ]
-
-
-        # Add new record.
-
-        existing_audit = pd.concat(
-
-            [
-
-                existing_audit,
-
-                audit_row
-
-            ],
-
-            ignore_index=True
-
-        )
-
-
-        # Rewrite CSV.
-
-        existing_audit.to_csv(
-
-            AUDIT_PATH,
-
-            index=False
-
-        )
-
-
-    else:
-
-        audit_row.to_csv(
-
-            AUDIT_PATH,
-
-            index=False
-
-        )
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "selected_transaction" not in st.session_state:
-
-    st.session_state.selected_transaction = None
-
-
-if "analysis_result" not in st.session_state:
-
-    st.session_state.analysis_result = None
-
-
-if "razorpay_order_id" not in st.session_state:
-
-    st.session_state.razorpay_order_id = ""
-
-
-# ============================================================
-# ML PREDICTION
+# PREDICTION FUNCTION
 # ============================================================
 
 def predict_recovery_probability(transaction):
 
-    if recovery_model is None:
-
-        return 0.0
-
-
     input_df = pd.DataFrame(
-
-        [
-
-            {
-
-                "amount":
-                    transaction["amount"],
-
-                "payment_method":
-                    transaction["payment_method"],
-
-                "customer_success_rate":
-                    transaction[
-                        "customer_success_rate"
-                    ],
-
-                "previous_failed_attempts":
-                    transaction[
-                        "previous_failed_attempts"
-                    ],
-
-                "is_new_device":
-                    transaction[
-                        "is_new_device"
-                    ],
-
-                "failure_reason":
-                    transaction[
-                        "failure_reason"
-                    ]
-
-            }
-
-        ]
-
+        [{
+            column: transaction[column]
+            for column in FEATURES
+        }]
     )
-
 
     probability = recovery_model.predict_proba(
         input_df
     )[0][1]
 
+    return float(probability)
 
-    return float(
-        probability
+
+# ============================================================
+# AI DECISION ENGINE
+# ============================================================
+
+def deterministic_decision(
+    transaction,
+    probability
+):
+
+    amount = float(
+        transaction["amount"]
     )
-
-
-# ============================================================
-# DETERMINISTIC FALLBACK
-# ============================================================
-
-def deterministic_recommendation(transaction, probability):
 
     failure_reason = str(
-        transaction[
-            "failure_reason"
-        ]
-    ).lower()
-
-
-    attempts = int(
-        transaction[
-            "previous_failed_attempts"
-        ]
+        transaction["failure_reason"]
     )
 
+    previous_failures = int(
+        transaction["previous_failed_attempts"]
+    )
 
-    if probability < 0.25:
+    success_rate = float(
+        transaction["customer_success_rate"]
+    )
 
-        action = "DO_NOT_RETRY"
+    # Safety rules
+    if previous_failures >= 4:
 
-        priority = "LOW"
+        return {
+            "action": "DO_NOT_RETRY",
+            "reason": (
+                "Customer has multiple previous "
+                "failed payment attempts."
+            )
+        }
 
+    if amount > 100000 and probability < 0.70:
 
-    elif "expired card" in failure_reason:
+        return {
+            "action": "ADDITIONAL_AUTHENTICATION",
+            "reason": (
+                "High-value transaction requires "
+                "additional verification."
+            )
+        }
 
-        action = "UPDATE_PAYMENT_METHOD"
+    if failure_reason == "Expired Card":
 
-        priority = "HIGH"
+        return {
+            "action": "UPDATE_PAYMENT_METHOD",
+            "reason": (
+                "Card appears to be expired. "
+                "Customer should update payment method."
+            )
+        }
 
+    if failure_reason == "Insufficient Funds":
 
-    elif attempts >= 3:
+        if probability >= 0.60:
 
-        action = "DO_NOT_RETRY"
+            return {
+                "action": "RETRY_LATER",
+                "reason": (
+                    "Retry later because the customer "
+                    "may have insufficient funds currently."
+                )
+            }
 
-        priority = "HIGH"
+        return {
+            "action": "DO_NOT_RETRY",
+            "reason": (
+                "Low predicted recovery probability "
+                "for insufficient-funds failure."
+            )
+        }
 
+    if failure_reason == "Network Error":
 
-    elif probability >= 0.75:
+        return {
+            "action": "RETRY_NOW",
+            "reason": (
+                "Network-related failures have a "
+                "relatively high retry potential."
+            )
+        }
 
-        action = "RETRY_NOW"
+    if failure_reason == "Bank Timeout":
 
-        priority = "HIGH"
+        return {
+            "action": "RETRY_NOW",
+            "reason": (
+                "Bank timeout can often be recovered "
+                "through a controlled retry."
+            )
+        }
 
+    if failure_reason == "Authentication Failed":
 
-    elif probability >= 0.55:
+        if probability >= 0.60:
 
-        action = "RETRY_LATER"
+            return {
+                "action": "ADDITIONAL_AUTHENTICATION",
+                "reason": (
+                    "Additional authentication may "
+                    "resolve the payment failure."
+                )
+            }
 
-        priority = "MEDIUM"
+        return {
+            "action": "DO_NOT_RETRY",
+            "reason": (
+                "Recovery probability is below "
+                "the safe retry threshold."
+            )
+        }
 
+    if probability >= 0.75:
 
-    else:
+        return {
+            "action": "RETRY_NOW",
+            "reason": (
+                "High predicted recovery probability."
+            )
+        }
 
-        action = "ADDITIONAL_AUTHENTICATION"
+    if probability >= 0.60:
 
-        priority = "MEDIUM"
+        return {
+            "action": "RETRY_LATER",
+            "reason": (
+                "Moderate recovery probability; "
+                "retry later to avoid aggressive retries."
+            )
+        }
 
+    if probability >= 0.45:
+
+        return {
+            "action": "UPDATE_PAYMENT_METHOD",
+            "reason": (
+                "Moderate recovery potential; "
+                "payment method intervention is safer."
+            )
+        }
 
     return {
-
-        "action":
-            action,
-
-        "priority":
-            priority,
-
-        "reason":
-            "Deterministic fallback recommendation.",
-
-        "fallback_used":
-            True
-
+        "action": "DO_NOT_RETRY",
+        "reason": (
+            "Recovery probability is too low "
+            "for another automated attempt."
+        )
     }
 
 
-# ============================================================
-# GEMINI AI DECISION
-# ============================================================
-
-def get_gemini_recommendation(
-
+def ask_gemini(
     transaction,
-
     probability
-
 ):
-
-
-    fallback = deterministic_recommendation(
-
-        transaction,
-
-        probability
-
-    )
-
 
     if gemini_client is None:
 
-        return fallback
-
+        return None
 
     prompt = f"""
+You are the decision engine for RevenueRescue AI.
 
-You are the AI decision engine for RevenueRescue AI.
+This is a SIMULATION-ONLY payment recovery system.
+Do not claim that money was actually recovered.
 
-This is a PAYMENT RECOVERY SIMULATION.
+Analyze this failed payment:
 
-Do not process real money.
+Transaction ID: {transaction["transaction_id"]}
+Amount: {transaction["amount"]}
+Payment Method: {transaction["payment_method"]}
+Customer Success Rate: {transaction["customer_success_rate"]}
+Previous Failed Attempts: {transaction["previous_failed_attempts"]}
+New Device: {transaction["is_new_device"]}
+Failure Reason: {transaction["failure_reason"]}
+ML Recovery Probability: {probability:.3f}
 
-Analyze the failed payment and recommend exactly ONE action.
+Choose exactly ONE action:
 
-Allowed actions:
-
-DO_NOT_RETRY
-UPDATE_PAYMENT_METHOD
 RETRY_NOW
 RETRY_LATER
+UPDATE_PAYMENT_METHOD
 ADDITIONAL_AUTHENTICATION
+DO_NOT_RETRY
 
-Transaction:
+Rules:
 
-Transaction ID:
-{transaction["transaction_id"]}
+1. Never recommend unlimited retries.
+2. Do not recommend retrying repeatedly.
+3. High previous failure count should reduce retrying.
+4. Expired cards should normally use UPDATE_PAYMENT_METHOD.
+5. High-value transactions may require ADDITIONAL_AUTHENTICATION.
+6. Low recovery probability should normally use DO_NOT_RETRY.
+7. The system must remain bounded and safe.
 
-Amount:
-₹{float(transaction["amount"]):.2f}
+Return ONLY valid JSON:
 
-Payment Method:
-{transaction["payment_method"]}
-
-Customer Success Rate:
-{transaction["customer_success_rate"]}
-
-Previous Failed Attempts:
-{transaction["previous_failed_attempts"]}
-
-New Device:
-{transaction["is_new_device"]}
-
-Failure Reason:
-{transaction["failure_reason"]}
-
-ML Recovery Probability:
-{probability:.4f}
-
-Return the decision in this exact format:
-
-ACTION: <one allowed action>
-PRIORITY: <LOW/MEDIUM/HIGH>
-REASON: <short reason>
-
+{{
+    "action": "ACTION_NAME",
+    "reason": "short explanation"
+}}
 """
-
 
     try:
 
@@ -988,476 +619,300 @@ REASON: <short reason>
             model="gemini-3.7-flash",
 
             contents=prompt
-
         )
-
 
         text = response.text.strip()
 
+        # Remove markdown fences if Gemini adds them
+        text = text.replace(
+            "```json",
+            ""
+        ).replace(
+            "```",
+            ""
+        ).strip()
 
-        action = None
-        priority = None
-        reason = ""
-
-
-        for line in text.splitlines():
-
-            line = line.strip()
-
-
-            if line.startswith("ACTION:"):
-
-                action = line.split(
-                    ":",
-                    1
-                )[1].strip()
-
-
-            elif line.startswith("PRIORITY:"):
-
-                priority = line.split(
-                    ":",
-                    1
-                )[1].strip()
-
-
-            elif line.startswith("REASON:"):
-
-                reason = line.split(
-                    ":",
-                    1
-                )[1].strip()
-
+        result = json.loads(text)
 
         allowed_actions = [
-
-            "DO_NOT_RETRY",
-
-            "UPDATE_PAYMENT_METHOD",
-
             "RETRY_NOW",
-
             "RETRY_LATER",
-
-            "ADDITIONAL_AUTHENTICATION"
-
+            "UPDATE_PAYMENT_METHOD",
+            "ADDITIONAL_AUTHENTICATION",
+            "DO_NOT_RETRY"
         ]
 
+        if result.get("action") not in allowed_actions:
 
-        if action not in allowed_actions:
+            return None
 
-            return fallback
-
-
-        if priority not in [
-
-            "LOW",
-
-            "MEDIUM",
-
-            "HIGH"
-
-        ]:
-
-            priority = "MEDIUM"
-
-
-        return {
-
-            "action":
-                action,
-
-            "priority":
-                priority,
-
-            "reason":
-                reason,
-
-            "fallback_used":
-                False
-
-        }
-
+        return result
 
     except Exception:
 
-        return fallback
+        return None
 
 
 # ============================================================
 # SAFETY GUARDRAILS
 # ============================================================
 
-def apply_guardrails(
-
+def apply_safety_guardrails(
     transaction,
-
-    ai_result,
-
+    ai_decision,
     probability
-
 ):
 
+    action = ai_decision["action"]
 
-    requested_action = ai_result.get(
-        "action",
-        "DO_NOT_RETRY"
+    previous_failures = int(
+        transaction["previous_failed_attempts"]
     )
 
-
-    attempts = int(
-        transaction[
-            "previous_failed_attempts"
-        ]
+    amount = float(
+        transaction["amount"]
     )
-
 
     failure_reason = str(
-        transaction[
-            "failure_reason"
-        ]
-    ).lower()
+        transaction["failure_reason"]
+    )
 
+    # Stop repeated retrying
+    if previous_failures >= 4:
 
-    # --------------------------------------------------------
-    # STOP RULE
-    # --------------------------------------------------------
+        action = "DO_NOT_RETRY"
 
-    if attempts >= 3:
-
-        return {
-
-            "approved_action":
-                "DO_NOT_RETRY",
-
-            "reason":
-                "Maximum retry threshold reached."
-
-        }
-
-
-    # --------------------------------------------------------
-    # EXPIRED CARD
-    # --------------------------------------------------------
-
-    if "expired card" in failure_reason:
+        reason = (
+            "Safety rule: maximum retry exposure "
+            "reached for this customer."
+        )
 
         return {
-
-            "approved_action":
-                "UPDATE_PAYMENT_METHOD",
-
-            "reason":
-                "Expired card requires payment method update."
-
+            "action": action,
+            "reason": reason,
+            "guardrail_triggered": True
         }
 
+    # Expired cards should not be retried
+    if failure_reason == "Expired Card":
 
-    # --------------------------------------------------------
-    # LOW PROBABILITY
-    # --------------------------------------------------------
+        action = "UPDATE_PAYMENT_METHOD"
 
-    if probability < 0.20:
+        reason = (
+            "Safety rule: expired cards require "
+            "payment method update."
+        )
 
         return {
-
-            "approved_action":
-                "DO_NOT_RETRY",
-
-            "reason":
-                "Recovery probability below safety threshold."
-
+            "action": action,
+            "reason": reason,
+            "guardrail_triggered": True
         }
 
+    # High value + lower confidence
+    if amount > 100000 and probability < 0.70:
 
-    # --------------------------------------------------------
-    # VALIDATE AI ACTION
-    # --------------------------------------------------------
+        action = "ADDITIONAL_AUTHENTICATION"
 
-    allowed_actions = [
-
-        "DO_NOT_RETRY",
-
-        "UPDATE_PAYMENT_METHOD",
-
-        "RETRY_NOW",
-
-        "RETRY_LATER",
-
-        "ADDITIONAL_AUTHENTICATION"
-
-    ]
-
-
-    if requested_action not in allowed_actions:
+        reason = (
+            "Safety rule: high-value transaction "
+            "requires additional authentication."
+        )
 
         return {
-
-            "approved_action":
-                "DO_NOT_RETRY",
-
-            "reason":
-                "AI action failed validation."
-
+            "action": action,
+            "reason": reason,
+            "guardrail_triggered": True
         }
-
 
     return {
-
-        "approved_action":
-            requested_action,
-
-        "reason":
-            "Action passed safety guardrails."
-
+        "action": action,
+        "reason": ai_decision["reason"],
+        "guardrail_triggered": False
     }
 
 
 # ============================================================
-# EXECUTE RECOVERY
+# AUDIT TRAIL
 # ============================================================
 
-def execute_recovery(
+AUDIT_COLUMNS = [
+    "timestamp",
+    "transaction_id",
+    "customer_id",
+    "amount",
+    "failure_reason",
+    "recovery_probability",
+    "ai_action",
+    "final_action",
+    "guardrail_triggered",
+    "execution_status",
+    "razorpay_test_order_id",
+    "simulated_recovered",
+    "notes"
+]
 
-    transaction,
 
-    action,
+def load_audit_trail():
 
-    ml_probability,
+    if not os.path.exists(AUDIT_PATH):
 
-    ai_result,
+        return pd.DataFrame(
+            columns=AUDIT_COLUMNS
+        )
 
-    guardrail_result
+    try:
 
+        df = pd.read_csv(
+            AUDIT_PATH,
+            keep_default_na=False
+        )
+
+        for column in AUDIT_COLUMNS:
+
+            if column not in df.columns:
+
+                df[column] = ""
+
+        return df[AUDIT_COLUMNS]
+
+    except Exception:
+
+        return pd.DataFrame(
+            columns=AUDIT_COLUMNS
+        )
+
+
+def write_audit_record(record):
+
+    os.makedirs(
+        os.path.dirname(AUDIT_PATH),
+        exist_ok=True
+    )
+
+    audit_df = load_audit_trail()
+
+    new_record = {
+        column: record.get(
+            column,
+            ""
+        )
+        for column in AUDIT_COLUMNS
+    }
+
+    audit_df = pd.concat(
+        [
+            audit_df,
+            pd.DataFrame([new_record])
+        ],
+        ignore_index=True
+    )
+
+    audit_df.to_csv(
+        AUDIT_PATH,
+        index=False
+    )
+
+
+# ============================================================
+# RAZORPAY TEST ORDER
+# ============================================================
+
+def create_razorpay_test_order(
+    amount
 ):
 
+    if razorpay_client is None:
 
-    razorpay_order_id = ""
-
-    recovery_result = "NOT_EXECUTED"
-
-    revenue_rescued = 0.0
-
-
-    # ========================================================
-    # DO NOT RETRY
-    # ========================================================
-
-    if action == "DO_NOT_RETRY":
-
-        recovery_result = "STOPPED"
-
-        revenue_rescued = 0.0
-
-
-    # ========================================================
-    # UPDATE PAYMENT METHOD
-    # ========================================================
-
-    elif action == "UPDATE_PAYMENT_METHOD":
-
-        st.info(
-            "Simulating payment method update..."
+        return None, (
+            "Razorpay Test Mode credentials "
+            "are not configured."
         )
 
+    try:
 
-        # In this demo, the payment method
-        # update is simulated.
-
-        order_result = create_razorpay_test_order(
-            transaction
+        # Razorpay amount is in paise
+        amount_paise = int(
+            round(
+                float(amount) * 100
+            )
         )
 
-
-        if order_result["success"]:
-
-            razorpay_order_id = (
-                order_result["order_id"]
-            )
-
-            recovery_result = (
-                "TEST_ORDER_CREATED"
-            )
-
-            revenue_rescued = float(
-                transaction["amount"]
-            )
-
-        else:
-
-            recovery_result = (
-                "RAZORPAY_TEST_ORDER_FAILED"
-            )
-
-
-    # ========================================================
-    # RETRY NOW
-    # ========================================================
-
-    elif action == "RETRY_NOW":
-
-        order_result = create_razorpay_test_order(
-            transaction
+        order = razorpay_client.order.create(
+            {
+                "amount": amount_paise,
+                "currency": "INR",
+                "receipt": (
+                    "rr_" +
+                    datetime.now().strftime(
+                        "%Y%m%d%H%M%S"
+                    )
+                )
+            }
         )
 
+        return order["id"], "SUCCESS"
 
-        if order_result["success"]:
+    except Exception as e:
 
-            razorpay_order_id = (
-                order_result["order_id"]
-            )
-
-            recovery_result = (
-                "TEST_ORDER_CREATED"
-            )
-
-            revenue_rescued = float(
-                transaction["amount"]
-            )
-
-        else:
-
-            recovery_result = (
-                "RAZORPAY_TEST_ORDER_FAILED"
-            )
+        return None, str(e)
 
 
-    # ========================================================
-    # RETRY LATER
-    # ========================================================
+# ============================================================
+# SIMULATED RECOVERY EXECUTION
+# ============================================================
 
-    elif action == "RETRY_LATER":
+def simulate_recovery(action):
 
-        st.info(
-            "Recovery scheduled for later."
-        )
+    # These probabilities are ONLY simulation assumptions.
+    # They do not represent real payment recovery rates.
 
+    success_probability = {
 
-        order_result = create_razorpay_test_order(
-            transaction
-        )
+        "RETRY_NOW": 0.70,
 
+        "RETRY_LATER": 0.55,
 
-        if order_result["success"]:
+        "UPDATE_PAYMENT_METHOD": 0.65,
 
-            razorpay_order_id = (
-                order_result["order_id"]
-            )
+        "ADDITIONAL_AUTHENTICATION": 0.60,
 
-            recovery_result = (
-                "TEST_ORDER_CREATED_SCHEDULED"
-            )
-
-            revenue_rescued = float(
-                transaction["amount"]
-            )
-
-        else:
-
-            recovery_result = (
-                "RAZORPAY_TEST_ORDER_FAILED"
-            )
-
-
-    # ========================================================
-    # ADDITIONAL AUTHENTICATION
-    # ========================================================
-
-    elif action == "ADDITIONAL_AUTHENTICATION":
-
-        st.info(
-            "Simulating additional authentication..."
-        )
-
-
-        order_result = create_razorpay_test_order(
-            transaction
-        )
-
-
-        if order_result["success"]:
-
-            razorpay_order_id = (
-                order_result["order_id"]
-            )
-
-            recovery_result = (
-                "TEST_ORDER_CREATED_AFTER_AUTH"
-            )
-
-            revenue_rescued = float(
-                transaction["amount"]
-            )
-
-        else:
-
-            recovery_result = (
-                "RAZORPAY_TEST_ORDER_FAILED"
-            )
-
-
-    # ========================================================
-    # SAVE RAZORPAY ORDER ID
-    # ========================================================
-
-    st.session_state.razorpay_order_id = (
-        razorpay_order_id
-    )
-
-
-    # ========================================================
-    # WRITE AUDIT RECORD
-    # ========================================================
-
-    write_audit_record(
-
-        transaction=
-
-            transaction,
-
-        ml_probability=
-
-            ml_probability,
-
-        ai_result=
-
-            ai_result,
-
-        guardrail_result=
-
-            guardrail_result,
-
-        action_executed=
-
-            action,
-
-        recovery_result=
-
-            recovery_result,
-
-        revenue_rescued=
-
-            revenue_rescued,
-
-        razorpay_order_id=
-
-            razorpay_order_id
-
-    )
-
-
-    return {
-
-        "recovery_result":
-            recovery_result,
-
-        "revenue_rescued":
-            revenue_rescued,
-
-        "razorpay_order_id":
-            razorpay_order_id
-
+        "DO_NOT_RETRY": 0.00
     }
+
+    probability = success_probability.get(
+        action,
+        0.00
+    )
+
+    recovered = random.random() < probability
+
+    return recovered
+
+
+# ============================================================
+# BATCH RESULTS
+# ============================================================
+
+def load_batch_results():
+
+    if not os.path.exists(BATCH_PATH):
+
+        return pd.DataFrame()
+
+    try:
+
+        return pd.read_csv(
+            BATCH_PATH,
+            keep_default_na=False
+        )
+
+    except Exception:
+
+        return pd.DataFrame()
+
+
+batch_results = load_batch_results()
 
 
 # ============================================================
@@ -1472,34 +927,177 @@ st.subheader(
     "AI-Powered Payment Recovery System"
 )
 
-
-st.warning(
+st.info(
     """
-    ⚠️ DEMO / SIMULATION ONLY
+    ⚠️ **SIMULATION-ONLY DEMO**
 
-    This application does not process real payments.
-    Razorpay integration uses TEST MODE only.
-    Revenue rescued values shown in the dashboard are simulated.
+    This application demonstrates an AI-assisted payment
+    recovery workflow using historical transaction data,
+    machine-learning predictions, bounded decision rules,
+    and Razorpay Test Mode.
+
+    No real customer payments or real money are processed.
     """
 )
 
 
 # ============================================================
-# RAZORPAY STATUS
+# SIDEBAR
 # ============================================================
 
-if razorpay_client:
+st.sidebar.title(
+    "RevenueRescue AI"
+)
 
-    st.success(
-        "🟢 Razorpay Test Mode connected"
+st.sidebar.markdown(
+    """
+### System Pipeline
+
+1. Payment failure detection
+2. Recovery probability prediction
+3. AI decision
+4. Safety guardrails
+5. Recovery action
+6. Razorpay Test Mode
+7. Audit trail
+8. Recovery analytics
+"""
+)
+
+st.sidebar.success(
+    "Model loaded successfully"
+)
+
+if gemini_client:
+
+    st.sidebar.success(
+        "Gemini AI: Connected"
     )
 
 else:
 
-    st.warning(
-        "🟡 Razorpay Test Mode credentials not configured. "
-        "The recovery workflow will still run in simulation mode."
+    st.sidebar.warning(
+        "Gemini AI: Fallback mode"
     )
+
+if razorpay_client:
+
+    st.sidebar.success(
+        "Razorpay: Test Mode"
+    )
+
+else:
+
+    st.sidebar.warning(
+        "Razorpay: Not configured"
+    )
+
+
+# ============================================================
+# OVERVIEW METRICS
+# ============================================================
+
+total_transactions = len(
+    transactions_df
+)
+
+failed_count = len(
+    failed_transactions
+)
+
+successful_count = (
+    total_transactions -
+    failed_count
+)
+
+total_transaction_value = (
+    transactions_df["amount"]
+    .sum()
+)
+
+revenue_at_risk = (
+    failed_transactions["amount"]
+    .sum()
+)
+
+historical_recovered_revenue = (
+    failed_transactions[
+        failed_transactions["recovered"] == 1
+    ]["amount"]
+    .sum()
+)
+
+historical_recovery_rate = (
+
+    (
+        failed_transactions["recovered"]
+        .sum()
+        /
+        failed_count
+    )
+    * 100
+
+    if failed_count > 0
+
+    else 0
+)
+
+
+st.header(
+    "📊 Revenue Recovery Overview"
+)
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Total Transactions",
+    f"{total_transactions:,}"
+)
+
+col2.metric(
+    "Failed Payments",
+    f"{failed_count:,}"
+)
+
+col3.metric(
+    "Revenue at Risk",
+    f"₹{revenue_at_risk:,.2f}"
+)
+
+col4.metric(
+    "Historical Recovery Rate",
+    f"{historical_recovery_rate:.2f}%"
+)
+
+
+st.divider()
+
+
+# ============================================================
+# SECOND METRICS ROW
+# ============================================================
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Successful Payments",
+    f"{successful_count:,}"
+)
+
+col2.metric(
+    "Total Transaction Value",
+    f"₹{total_transaction_value:,.2f}"
+)
+
+col3.metric(
+    "Historically Recovered Revenue",
+    f"₹{historical_recovered_revenue:,.2f}"
+)
+
+col4.metric(
+    "Unrecovered Revenue",
+    f"₹{revenue_at_risk - historical_recovered_revenue:,.2f}"
+)
 
 
 # ============================================================
@@ -1507,813 +1105,603 @@ else:
 # ============================================================
 
 tab1, tab2, tab3 = st.tabs(
-
     [
-
         "🤖 Recovery Agent",
-
-        "📊 Analytics",
-
+        "📈 Analytics",
         "🧾 Audit Trail"
-
     ]
-
 )
 
 
 # ============================================================
-# TAB 1 — RECOVERY AGENT
+# TAB 1 - RECOVERY AGENT
 # ============================================================
 
 with tab1:
 
     st.header(
-        "AI Payment Recovery Agent"
+        "🤖 AI Recovery Agent"
     )
 
+    if failed_transactions.empty:
 
-    if transactions_df.empty:
-
-        st.error(
-            "Transaction dataset could not be loaded."
+        st.warning(
+            "No failed transactions found."
         )
 
     else:
 
-        failed_df = transactions_df[
-            transactions_df["status"].astype(str).str.lower()
-            == "failed"
-        ].copy()
+        transaction_ids = (
+            failed_transactions[
+                "transaction_id"
+            ]
+            .astype(str)
+            .tolist()
+        )
 
+        selected_transaction_id = st.selectbox(
+            "Select a failed payment",
+            transaction_ids
+        )
 
-        if failed_df.empty:
-
-            st.success(
-                "No failed transactions found."
-            )
-
-        else:
-
-            transaction_options = (
-
-                failed_df[
+        selected_transaction = (
+            failed_transactions[
+                failed_transactions[
                     "transaction_id"
+                ].astype(str)
+                ==
+                selected_transaction_id
+            ]
+            .iloc[0]
+        )
+
+        st.subheader(
+            "Payment Information"
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Transaction Amount",
+            f"₹{float(selected_transaction['amount']):,.2f}"
+        )
+
+        c2.metric(
+            "Failure Reason",
+            str(
+                selected_transaction[
+                    "failure_reason"
                 ]
-                .astype(str)
-                .tolist()
-
             )
+        )
 
-
-            selected_id = st.selectbox(
-
-                "Select a failed transaction",
-
-                transaction_options
-
-            )
-
-
-            selected_transaction = (
-
-                failed_df[
-                    failed_df[
-                        "transaction_id"
-                    ].astype(str)
-                    == selected_id
-                ]
-                .iloc[0]
-                .copy()
-
-            )
-
-
-            st.session_state.selected_transaction = (
-                selected_transaction
-            )
-
-
-            # ------------------------------------------------
-            # TRANSACTION DETAILS
-            # ------------------------------------------------
-
-            st.subheader(
-                "Transaction Details"
-            )
-
-
-            col1, col2, col3, col4 = st.columns(4)
-
-
-            col1.metric(
-
-                "Transaction",
-
-                str(
-                    selected_transaction[
-                        "transaction_id"
-                    ]
-                )
-
-            )
-
-
-            col2.metric(
-
-                "Amount",
-
-                f"₹{float(selected_transaction['amount']):,.2f}"
-
-            )
-
-
-            col3.metric(
-
-                "Payment Method",
-
-                str(
-                    selected_transaction[
-                        "payment_method"
-                    ]
-                )
-
-            )
-
-
-            col4.metric(
-
-                "Failure Reason",
-
-                str(
-                    selected_transaction[
-                        "failure_reason"
-                    ]
-                )
-
-            )
-
-
-            st.write(
-
-                "Previous Failed Attempts:",
-
+        c3.metric(
+            "Previous Failures",
+            int(
                 selected_transaction[
                     "previous_failed_attempts"
                 ]
+            )
+        )
 
+        st.write(
+            "**Transaction ID:**",
+            selected_transaction[
+                "transaction_id"
+            ]
+        )
+
+        st.write(
+            "**Customer ID:**",
+            selected_transaction[
+                "customer_id"
+            ]
+        )
+
+        st.write(
+            "**Payment Method:**",
+            selected_transaction[
+                "payment_method"
+            ]
+        )
+
+        st.write(
+            "**Customer Success Rate:**",
+            f"{float(selected_transaction['customer_success_rate']) * 100:.2f}%"
+        )
+
+        st.divider()
+
+        if st.button(
+            "🔍 Analyze Payment with AI",
+            type="primary"
+        ):
+
+            recovery_probability = (
+                predict_recovery_probability(
+                    selected_transaction
+                )
             )
 
+            st.session_state[
+                "recovery_probability"
+            ] = recovery_probability
+
+            # Gemini decision
+            gemini_decision = ask_gemini(
+                selected_transaction,
+                recovery_probability
+            )
+
+            if gemini_decision:
+
+                ai_decision = gemini_decision
+
+                decision_source = (
+                    "Gemini AI"
+                )
+
+            else:
+
+                ai_decision = deterministic_decision(
+                    selected_transaction,
+                    recovery_probability
+                )
+
+                decision_source = (
+                    "Deterministic AI Fallback"
+                )
+
+            final_decision = apply_safety_guardrails(
+                selected_transaction,
+                ai_decision,
+                recovery_probability
+            )
+
+            st.session_state[
+                "ai_decision"
+            ] = ai_decision
+
+            st.session_state[
+                "final_decision"
+            ] = final_decision
+
+            st.session_state[
+                "selected_transaction"
+            ] = selected_transaction
+
+            st.session_state[
+                "decision_source"
+            ] = decision_source
+
+        if "recovery_probability" in st.session_state:
+
+            probability = (
+                st.session_state[
+                    "recovery_probability"
+                ]
+            )
+
+            ai_decision = (
+                st.session_state[
+                    "ai_decision"
+                ]
+            )
+
+            final_decision = (
+                st.session_state[
+                    "final_decision"
+                ]
+            )
+
+            st.subheader(
+                "🧠 Recovery Intelligence"
+            )
+
+            st.progress(
+                probability
+            )
+
+            st.metric(
+                "Predicted Recovery Probability",
+                f"{probability * 100:.2f}%"
+            )
 
             st.write(
-
-                "Customer Success Rate:",
-
-                selected_transaction[
-                    "customer_success_rate"
+                "**Decision Source:**",
+                st.session_state[
+                    "decision_source"
                 ]
-
             )
 
+            st.subheader(
+                "AI Recommendation"
+            )
 
-            # ------------------------------------------------
-            # ANALYZE BUTTON
-            # ------------------------------------------------
+            st.info(
+                f"""
+                **AI Action:** `{ai_decision["action"]}`
 
-            if st.button(
+                **Reason:** {ai_decision["reason"]}
+                """
+            )
 
-                "🔍 Analyze Payment with AI",
+            st.subheader(
+                "🛡️ Safety Layer"
+            )
 
-                use_container_width=True
+            if final_decision[
+                "guardrail_triggered"
+            ]:
 
-            ):
+                st.warning(
+                    f"""
+                    Safety guardrail triggered.
 
-                with st.spinner(
-                    "Running ML + AI analysis..."
-                ):
+                    Final action:
+                    **{final_decision["action"]}**
 
-
-                    probability = (
-
-                        predict_recovery_probability(
-
-                            selected_transaction
-
-                        )
-
-                    )
-
-
-                    ai_result = (
-
-                        get_gemini_recommendation(
-
-                            selected_transaction,
-
-                            probability
-
-                        )
-
-                    )
-
-
-                    guardrail_result = (
-
-                        apply_guardrails(
-
-                            selected_transaction,
-
-                            ai_result,
-
-                            probability
-
-                        )
-
-                    )
-
-
-                    st.session_state.analysis_result = {
-
-                        "probability":
-                            probability,
-
-                        "ai_result":
-                            ai_result,
-
-                        "guardrail_result":
-                            guardrail_result
-
-                    }
-
-
-            # ------------------------------------------------
-            # SHOW ANALYSIS
-            # ------------------------------------------------
-
-            if st.session_state.analysis_result:
-
-                result = (
-                    st.session_state.analysis_result
+                    Reason:
+                    {final_decision["reason"]}
+                    """
                 )
 
+            else:
 
-                probability = (
-                    result["probability"]
+                st.success(
+                    f"""
+                    No additional safety override required.
+
+                    Final action:
+                    **{final_decision["action"]}**
+                    """
                 )
 
+            st.divider()
 
-                ai_result = (
-                    result["ai_result"]
+            st.subheader(
+                "⚡ Recovery Action Center"
+            )
+
+            final_action = final_decision[
+                "action"
+            ]
+
+            if final_action == "DO_NOT_RETRY":
+
+                st.warning(
+                    "⛔ Recovery stopped. No automated retry will be attempted."
                 )
-
-
-                guardrail_result = (
-                    result["guardrail_result"]
-                )
-
-
-                st.divider()
-
-
-                st.subheader(
-                    "🧠 AI Decision"
-                )
-
-
-                col1, col2, col3 = st.columns(3)
-
-
-                col1.metric(
-
-                    "ML Recovery Probability",
-
-                    f"{probability * 100:.2f}%"
-
-                )
-
-
-                col2.metric(
-
-                    "AI Recommendation",
-
-                    ai_result[
-                        "action"
-                    ]
-
-                )
-
-
-                col3.metric(
-
-                    "Priority",
-
-                    ai_result[
-                        "priority"
-                    ]
-
-                )
-
-
-                if ai_result.get(
-                    "fallback_used",
-                    False
-                ):
-
-                    st.info(
-                        "Gemini unavailable or returned an invalid response. "
-                        "Deterministic fallback logic was used."
-                    )
-
-                else:
-
-                    st.success(
-                        "Gemini AI decision generated successfully."
-                    )
-
-
-                st.write(
-
-                    "**AI Reason:**",
-
-                    ai_result.get(
-                        "reason",
-                        ""
-                    )
-
-                )
-
-
-                st.divider()
-
-
-                st.subheader(
-                    "🛡️ Safety Guardrail"
-                )
-
-
-                st.info(
-
-                    f"Approved Action: "
-                    f"**{guardrail_result['approved_action']}**"
-
-                )
-
-
-                st.write(
-
-                    guardrail_result[
-                        "reason"
-                    ]
-
-                )
-
-
-                # ------------------------------------------------
-                # EXECUTE RECOVERY
-                # ------------------------------------------------
-
-                st.divider()
-
-
-                approved_action = (
-
-                    guardrail_result[
-                        "approved_action"
-                    ]
-
-                )
-
 
                 if st.button(
-
-                    "🚀 Execute Recovery Action",
-
-                    use_container_width=True
-
+                    "📝 Record Stop Decision"
                 ):
 
-                    with st.spinner(
-                        "Executing recovery workflow..."
-                    ):
-
-                        execution_result = (
-
-                            execute_recovery(
-
-                                selected_transaction,
-
-                                approved_action,
-
-                                probability,
-
-                                ai_result,
-
-                                guardrail_result
-
-                            )
-
-                        )
-
+                    write_audit_record(
+                        {
+                            "timestamp": datetime.now().isoformat(),
+                            "transaction_id": selected_transaction["transaction_id"],
+                            "customer_id": selected_transaction["customer_id"],
+                            "amount": selected_transaction["amount"],
+                            "failure_reason": selected_transaction["failure_reason"],
+                            "recovery_probability": probability,
+                            "ai_action": ai_decision["action"],
+                            "final_action": final_action,
+                            "guardrail_triggered": final_decision["guardrail_triggered"],
+                            "execution_status": "STOPPED",
+                            "razorpay_test_order_id": "",
+                            "simulated_recovered": False,
+                            "notes": final_decision["reason"]
+                        }
+                    )
 
                     st.success(
-                        "Recovery workflow executed."
+                        "Decision recorded in audit trail."
                     )
 
+            else:
 
-                    # --------------------------------------------
-                    # RECOVERY RESULT
-                    # --------------------------------------------
+                st.write(
+                    f"""
+                    Recommended action:
 
-                    st.subheader(
-                        "Recovery Result"
+                    **{final_action}**
+                    """
+                )
+
+                if st.button(
+                    "🚀 Execute Recovery Action",
+                    type="primary"
+                ):
+
+                    razorpay_order_id = ""
+
+                    execution_status = (
+                        "SIMULATION_EXECUTED"
                     )
 
+                    # ------------------------------------------------
+                    # Razorpay Test Mode
+                    # ------------------------------------------------
 
-                    col1, col2 = st.columns(2)
+                    if razorpay_client:
 
+                        order_id, result = (
+                            create_razorpay_test_order(
+                                selected_transaction[
+                                    "amount"
+                                ]
+                            )
+                        )
 
-                    col1.metric(
+                        if order_id:
 
-                        "Recovery Result",
+                            razorpay_order_id = (
+                                order_id
+                            )
 
-                        execution_result[
-                            "recovery_result"
-                        ]
+                            execution_status = (
+                                "TEST_ORDER_CREATED"
+                            )
 
+                            st.success(
+                                "✅ Razorpay Test Mode order created."
+                            )
+
+                            st.code(
+                                razorpay_order_id
+                            )
+
+                        else:
+
+                            st.warning(
+                                "Razorpay Test Mode order could not be created."
+                            )
+
+                            st.caption(
+                                str(result)
+                            )
+
+                    # ------------------------------------------------
+                    # Simulation
+                    # ------------------------------------------------
+
+                    simulated_recovered = (
+                        simulate_recovery(
+                            final_action
+                        )
                     )
 
-
-                    col2.metric(
-
-                        "Revenue Rescued "
-                        "(Simulation)",
-
-                        f"₹{execution_result['revenue_rescued']:,.2f}"
-
+                    write_audit_record(
+                        {
+                            "timestamp": datetime.now().isoformat(),
+                            "transaction_id": selected_transaction["transaction_id"],
+                            "customer_id": selected_transaction["customer_id"],
+                            "amount": selected_transaction["amount"],
+                            "failure_reason": selected_transaction["failure_reason"],
+                            "recovery_probability": probability,
+                            "ai_action": ai_decision["action"],
+                            "final_action": final_action,
+                            "guardrail_triggered": final_decision["guardrail_triggered"],
+                            "execution_status": execution_status,
+                            "razorpay_test_order_id": razorpay_order_id,
+                            "simulated_recovered": simulated_recovered,
+                            "notes": "Simulation-only recovery execution."
+                        }
                     )
 
-
-                    # --------------------------------------------
-                    # RAZORPAY ORDER ID
-                    # --------------------------------------------
-
-                    if execution_result[
-                        "razorpay_order_id"
-                    ]:
+                    if simulated_recovered:
 
                         st.success(
+                            f"""
+                            💰 **Recovery action simulated successfully.**
 
-                            "✅ Razorpay Test Mode Order Created"
+                            Simulated rescued amount:
+                            **₹{float(selected_transaction["amount"]):,.2f}**
 
+                            This is NOT real recovered money.
+                            """
                         )
-
-
-                        st.code(
-
-                            execution_result[
-                                "razorpay_order_id"
-                            ],
-
-                            language="text"
-
-                        )
-
-
-                        st.caption(
-
-                            "This is a Razorpay TEST MODE order ID. "
-                            "No real money was processed."
-
-                        )
-
 
                     else:
 
-                        st.info(
-                            "No Razorpay Test Mode order was created for this action."
+                        st.error(
+                            """
+                            Recovery action was simulated but
+                            the payment was not recovered in the simulation.
+                            """
                         )
+
+                    st.info(
+                        """
+                        🔒 Audit record created.
+
+                        Any Razorpay Order ID shown above is from
+                        **Razorpay Test Mode only**.
+                        """
+                    )
 
 
 # ============================================================
-# TAB 2 — ANALYTICS
+# TAB 2 - ANALYTICS
 # ============================================================
 
 with tab2:
 
     st.header(
-        "📊 Revenue Recovery Analytics"
+        "📈 Revenue Recovery Analytics"
+    )
+
+    st.subheader(
+        "Failure Reason Analysis"
+    )
+
+    reason_analysis = (
+        failed_transactions
+        .groupby("failure_reason")
+        .agg(
+            failed_payments=(
+                "transaction_id",
+                "count"
+            ),
+            revenue_at_risk=(
+                "amount",
+                "sum"
+            ),
+            historically_recovered=(
+                "recovered",
+                "sum"
+            )
+        )
+        .reset_index()
+    )
+
+    reason_analysis[
+        "historical_recovery_rate"
+    ] = (
+
+        reason_analysis[
+            "historically_recovered"
+        ]
+        /
+        reason_analysis[
+            "failed_payments"
+        ]
+        * 100
+    )
+
+    reason_analysis = (
+        reason_analysis
+        .sort_values(
+            "revenue_at_risk",
+            ascending=False
+        )
+    )
+
+    st.dataframe(
+        reason_analysis,
+        use_container_width=True
+    )
+
+    st.subheader(
+        "Failure Reason Revenue at Risk"
+    )
+
+    chart_data = (
+        reason_analysis[
+            [
+                "failure_reason",
+                "revenue_at_risk"
+            ]
+        ]
+        .set_index(
+            "failure_reason"
+        )
+    )
+
+    st.bar_chart(
+        chart_data
+    )
+
+    st.subheader(
+        "Historical Recovery Performance"
+    )
+
+    recovered_count = int(
+        failed_transactions[
+            "recovered"
+        ].sum()
+    )
+
+    unrecovered_count = (
+        failed_count -
+        recovered_count
+    )
+
+    performance_df = pd.DataFrame(
+        {
+            "Status": [
+                "Recovered",
+                "Unrecovered"
+            ],
+            "Payments": [
+                recovered_count,
+                unrecovered_count
+            ]
+        }
+    )
+
+    st.dataframe(
+        performance_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.divider()
+
+    st.subheader(
+        "🤖 Model Evaluation"
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "Accuracy",
+        f"{model_metrics['accuracy'] * 100:.2f}%"
+    )
+
+    c2.metric(
+        "Precision",
+        f"{model_metrics['precision'] * 100:.2f}%"
+    )
+
+    c3.metric(
+        "Recall",
+        f"{model_metrics['recall'] * 100:.2f}%"
+    )
+
+    c4.metric(
+        "F1 Score",
+        f"{model_metrics['f1'] * 100:.2f}%"
+    )
+
+    c5.metric(
+        "ROC-AUC",
+        f"{model_metrics['roc_auc']:.3f}"
+    )
+
+    st.caption(
+        "Metrics are calculated on a held-out test set."
+    )
+
+    cm = model_metrics[
+        "confusion_matrix"
+    ]
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=[
+            "Actual 0",
+            "Actual 1"
+        ],
+        columns=[
+            "Predicted 0",
+            "Predicted 1"
+        ]
+    )
+
+    st.write(
+        "**Confusion Matrix**"
+    )
+
+    st.dataframe(
+        cm_df,
+        use_container_width=True
     )
 
 
-    if transactions_df.empty:
-
-        st.warning(
-            "Transaction data unavailable."
-        )
-
-    else:
-
-        failed_transactions = transactions_df[
-            transactions_df["status"].astype(str).str.lower()
-            == "failed"
-        ]
-
-
-        total_transactions = len(
-            transactions_df
-        )
-
-
-        failed_count = len(
-            failed_transactions
-        )
-
-
-        total_value = (
-            transactions_df["amount"]
-            .astype(float)
-            .sum()
-        )
-
-
-        revenue_at_risk = (
-            failed_transactions["amount"]
-            .astype(float)
-            .sum()
-        )
-
-
-        recovered_revenue = (
-
-            failed_transactions[
-                failed_transactions[
-                    "recovered"
-                ].astype(int)
-                == 1
-            ]["amount"]
-            .astype(float)
-            .sum()
-
-        )
-
-
-        unrecovered_revenue = (
-
-            revenue_at_risk
-            - recovered_revenue
-
-        )
-
-
-        recovery_count = len(
-
-            failed_transactions[
-                failed_transactions[
-                    "recovered"
-                ].astype(int)
-                == 1
-            ]
-
-        )
-
-
-        recovery_rate = (
-
-            recovery_count
-            / failed_count
-            * 100
-
-            if failed_count > 0
-
-            else 0
-
-        )
-
-
-        # ------------------------------------------------
-        # METRICS
-        # ------------------------------------------------
-
-        col1, col2, col3, col4 = st.columns(4)
-
-
-        col1.metric(
-
-            "Total Transactions",
-
-            f"{total_transactions:,}"
-
-        )
-
-
-        col2.metric(
-
-            "Failed Transactions",
-
-            f"{failed_count:,}"
-
-        )
-
-
-        col3.metric(
-
-            "Revenue at Risk",
-
-            f"₹{revenue_at_risk:,.2f}"
-
-        )
-
-
-        col4.metric(
-
-            "Historical Recovery Rate",
-
-            f"{recovery_rate:.2f}%"
-
-        )
-
-
-        st.divider()
-
-
-        col1, col2 = st.columns(2)
-
-
-        col1.metric(
-
-            "Recovered Revenue",
-
-            f"₹{recovered_revenue:,.2f}"
-
-        )
-
-
-        col2.metric(
-
-            "Unrecovered Revenue",
-
-            f"₹{unrecovered_revenue:,.2f}"
-
-        )
-
-
-        # ------------------------------------------------
-        # FAILURE REASON ANALYSIS
-        # ------------------------------------------------
-
-        st.subheader(
-            "Failure Reason Analysis"
-        )
-
-
-        reason_analysis = (
-
-            failed_transactions
-            .groupby("failure_reason")
-            .agg(
-
-                failed_transactions=(
-                    "transaction_id",
-                    "count"
-                ),
-
-                revenue_at_risk=(
-                    "amount",
-                    "sum"
-                ),
-
-                recovered_revenue=(
-                    "amount",
-                    lambda x:
-                        x[
-                            failed_transactions.loc[
-                                x.index,
-                                "recovered"
-                            ].astype(int)
-                            == 1
-                        ].sum()
-                )
-
-            )
-            .reset_index()
-
-        )
-
-
-        reason_analysis[
-            "recovery_rate"
-        ] = (
-
-            reason_analysis[
-                "recovered_revenue"
-            ]
-
-            /
-
-            reason_analysis[
-                "revenue_at_risk"
-            ]
-
-            * 100
-
-        )
-
-
-        st.dataframe(
-
-            reason_analysis,
-
-            use_container_width=True,
-
-            hide_index=True
-
-        )
-
-
-        # ------------------------------------------------
-        # MODEL PERFORMANCE
-        # ------------------------------------------------
-
-        st.subheader(
-            "🤖 ML Model Performance"
-        )
-
-
-        if model_metrics:
-
-            col1, col2, col3, col4 = st.columns(4)
-
-
-            col1.metric(
-
-                "Accuracy",
-
-                f"{model_metrics['accuracy']:.4f}"
-
-            )
-
-
-            col2.metric(
-
-                "Precision",
-
-                f"{model_metrics['precision']:.4f}"
-
-            )
-
-
-            col3.metric(
-
-                "Recall",
-
-                f"{model_metrics['recall']:.4f}"
-
-            )
-
-
-            col4.metric(
-
-                "ROC-AUC",
-
-                f"{model_metrics['roc_auc']:.4f}"
-
-            )
-
-
-            st.write(
-                "Confusion Matrix:"
-            )
-
-
-            cm = model_metrics[
-                "confusion_matrix"
-            ]
-
-
-            cm_df = pd.DataFrame(
-
-                cm,
-
-                index=[
-                    "Actual 0",
-                    "Actual 1"
-                ],
-
-                columns=[
-                    "Predicted 0",
-                    "Predicted 1"
-                ]
-
-            )
-
-
-            st.dataframe(
-                cm_df,
-                use_container_width=True
-            )
-
-
 # ============================================================
-# TAB 3 — AUDIT TRAIL
+# TAB 3 - AUDIT TRAIL
 # ============================================================
 
 with tab3:
@@ -2322,188 +1710,43 @@ with tab3:
         "🧾 Recovery Audit Trail"
     )
 
-
     audit_df = load_audit_trail()
-
 
     if audit_df.empty:
 
         st.info(
-            "No recovery actions have been recorded yet."
+            """
+            No recovery actions have been executed yet.
+
+            Analyze a failed payment and execute a recovery
+            action to create an audit record.
+            """
         )
 
     else:
 
-        # ------------------------------------------------
-        # FORCE RAZORPAY COLUMN
-        # ------------------------------------------------
-
-        if "razorpay_test_order_id" not in audit_df.columns:
-
-            audit_df[
-                "razorpay_test_order_id"
-            ] = ""
-
-
-        # ------------------------------------------------
-        # AUDIT METRICS
-        # ------------------------------------------------
-
-        total_actions = len(
-            audit_df
+        st.metric(
+            "Total Audit Records",
+            len(audit_df)
         )
-
-
-        successful_test_orders = (
-
-            audit_df[
-                "razorpay_test_order_id"
-            ]
-            .astype(str)
-            .str.startswith(
-                "order_"
-            )
-            .sum()
-
-        )
-
-
-        total_simulated_revenue = (
-
-            pd.to_numeric(
-
-                audit_df[
-                    "revenue_rescued"
-                ],
-
-                errors="coerce"
-
-            )
-            .fillna(0)
-            .sum()
-
-        )
-
-
-        col1, col2, col3 = st.columns(3)
-
-
-        col1.metric(
-
-            "Recovery Actions",
-
-            f"{total_actions:,}"
-
-        )
-
-
-        col2.metric(
-
-            "Razorpay Test Orders",
-
-            f"{successful_test_orders:,}"
-
-        )
-
-
-        col3.metric(
-
-            "Simulated Revenue Rescued",
-
-            f"₹{total_simulated_revenue:,.2f}"
-
-        )
-
-
-        st.divider()
-
-
-        # ------------------------------------------------
-        # DISPLAY AUDIT TRAIL
-        # ------------------------------------------------
 
         st.dataframe(
-
-            audit_df,
-
-            use_container_width=True,
-
-            hide_index=True
-
-        )
-
-
-        # ------------------------------------------------
-        # RAZORPAY ORDER IDS
-        # ------------------------------------------------
-
-        st.subheader(
-            "Razorpay Test Mode Orders"
-        )
-
-
-        razorpay_orders = audit_df[
-
-            audit_df[
-                "razorpay_test_order_id"
-            ]
-            .astype(str)
-            .str.startswith(
-                "order_"
-            )
-
-        ]
-
-
-        if razorpay_orders.empty:
-
-            st.info(
-                "No Razorpay Test Mode order IDs recorded yet."
-            )
-
-        else:
-
-            display_columns = [
-
+            audit_df.sort_values(
                 "timestamp",
+                ascending=False
+            ),
+            use_container_width=True,
+            height=500
+        )
 
-                "transaction_id",
-
-                "amount",
-
-                "action_executed",
-
-                "recovery_result",
-
-                "razorpay_test_order_id",
-
-                "revenue_rescued"
-
-            ]
-
-
-            available_columns = [
-
-                column
-
-                for column in display_columns
-
-                if column in razorpay_orders.columns
-
-            ]
-
-
-            st.dataframe(
-
-                razorpay_orders[
-                    available_columns
-                ],
-
-                use_container_width=True,
-
-                hide_index=True
-
-            )
+        st.download_button(
+            label="⬇️ Download Audit Trail",
+            data=audit_df.to_csv(
+                index=False
+            ),
+            file_name="audit_trail.csv",
+            mime="text/csv"
+        )
 
 
 # ============================================================
@@ -2512,17 +1755,13 @@ with tab3:
 
 st.divider()
 
-
 st.caption(
-
     """
-    RevenueRescue AI | Razorpay AI Buildathon 2026
+RevenueRescue AI | AI-Powered Payment Recovery System
 
-    AI-powered payment recovery simulation using
-    Random Forest + Gemini + deterministic safety guardrails
-    + Razorpay Test Mode.
+Built for the Razorpay AI Buildathon.
 
-    No real payments are processed.
-    """
-
+⚠️ Demonstration and simulation only.
+No real payments or real customer money are processed.
+"""
 )
