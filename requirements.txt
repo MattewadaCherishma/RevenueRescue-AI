@@ -5,3 +5,4 @@ scikit-learn==1.8.0
 joblib==1.5.3
 google-genai==2.22.0
 python-dotenv==1.2.3
+razorpay
